@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    /* Mirrors the look of the Stream Deck property inspector. */
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; background: #2d2d2d; color: #d8d8d8; font: 9pt "Segoe UI", Arial, sans-serif; }
+    body { padding: 6px 12px 10px 0; }
+    .item { display: flex; align-items: center; min-height: 32px; margin: 2px 0; }
+    .item label { flex: none; width: 103px; padding-right: 10px; text-align: right; color: #969696; }
+    .item select {
+      flex: 1; min-width: 0; height: 26px; padding: 0 26px 0 6px;
+      background: #3d3d3d url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%23d8d8d8' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 8px center;
+      color: #d8d8d8; border: 0; border-radius: 3px; font: inherit; appearance: none; outline: none; cursor: pointer;
+    }
+    .item select:focus { box-shadow: 0 0 0 1px #6b6b6b; }
+    .item select:disabled { opacity: .45; cursor: default; }
+    option { background: #3d3d3d; color: #d8d8d8; }
+    .hint { margin: 6px 0 10px 113px; padding-right: 4px; color: #969696; line-height: 1.45; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <div id="fields"></div>
+  <p class="hint" id="hint"></p>
+  <p class="hint">Нужно запущенное приложение SpeechToText. Если оно закрыто, кнопка запустит его сама.</p>
+
+  <script>
+    'use strict';
+
+    const LANGS = [
+      ['en', 'English'], ['ru', 'Русский'], ['uk', 'Українська'], ['be', 'Беларуская'], ['kk', 'Қазақша'],
+      ['de', 'Deutsch'], ['fr', 'Français'], ['es', 'Español (España)'], ['it', 'Italiano'], ['pt', 'Português'],
+      ['pl', 'Polski'], ['tr', 'Türkçe'], ['zh', '中文'], ['ja', '日本語'], ['ko', '한국어'], ['ar', 'العربية'],
+    ];
+    const MODE = [['toggle', 'Нажать — запись, ещё раз — готово'], ['hold', 'Удерживать, пока говорю']];
+
+    // Settings per key kind: [setting, label, options, default]. Defaults match the plugin's.
+    const FORMS = {
+      dictate: {
+        fields: [['mode', 'Нажатие', MODE, 'toggle']],
+        hint: 'Текст вставится туда, где стоит курсор. Стиль обработки и микрофон — в приложении SpeechToText.',
+      },
+      listen: {
+        fields: [
+          ['to', 'Перевести на', [['', 'Как в приложении'], ...LANGS], ''],
+          ['output', 'Текст', [['', 'Как в приложении'], ['show', 'Показать в окне'], ['clipboard', 'Скопировать в буфер'], ['insert', 'Вставить в активное поле']], ''],
+        ],
+        hint: 'Нажмите, чтобы записать звук, который играет в колонках или наушниках, и ещё раз — чтобы получить текст.',
+      },
+      translate: {
+        fields: [
+          ['from', 'С языка', [['', 'Любой'], ...LANGS], ''],
+          ['to', 'На язык', LANGS, 'en'],
+          ['source', 'Что слушать', [['mic', 'Мой голос (микрофон)'], ['system', 'Звук системы (видео, созвон)']], 'mic'],
+          ['output', 'Результат', [['insert', 'Вставить в активное поле'], ['show', 'Показать в окне'], ['clipboard', 'Скопировать в буфер']], 'insert'],
+          ['mode', 'Нажатие', MODE, 'toggle'],
+        ],
+        hint: 'Говорите на одном языке — получите текст на другом, уже без слов-паразитов и запинок.',
+      },
+      cancel: {
+        fields: [],
+        hint: 'Останавливает запись или обработку без вставки текста — как Esc. Пока что-то идёт, кнопка подсвечена.',
+      },
+    };
+
+    let ws, uuid, kind;
+    let settings = {};
+
+    function render() {
+      const form = FORMS[kind] || { fields: [], hint: '' };
+      const box = document.getElementById('fields');
+      box.textContent = '';
+      for (const [key, label, options, def] of form.fields) {
+        const item = document.createElement('div');
+        item.className = 'item';
+        const l = document.createElement('label');
+        l.textContent = label;
+        const sel = document.createElement('select');
+        sel.dataset.key = key;
+        for (const [value, text] of options) sel.add(new Option(text, value));
+        sel.value = settings[key] ?? def;
+        sel.addEventListener('change', () => save(key, sel.value));
+        item.append(l, sel);
+        box.append(item);
+      }
+      document.getElementById('hint').textContent = form.hint;
+      sync();
+    }
+
+    // sync greys out choices that don't apply: holding only works for the microphone.
+    function sync() {
+      const mode = document.querySelector('select[data-key="mode"]');
+      const source = document.querySelector('select[data-key="source"]');
+      if (mode && source) mode.disabled = source.value === 'system';
+    }
+
+    function save(key, value) {
+      settings[key] = value;
+      sync();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ event: 'setSettings', context: uuid, payload: settings }));
+      }
+    }
+
+    // Called by Stream Deck when the property inspector opens.
+    window.connectElgatoStreamDeckSocket = (port, inUUID, registerEvent, info, actionInfo) => {
+      uuid = inUUID;
+      const ai = JSON.parse(actionInfo);
+      kind = ai.action.split('.').pop();
+      settings = (ai.payload && ai.payload.settings) || {};
+      render();
+      ws = new WebSocket(`ws://127.0.0.1:${port}`);
+      ws.onopen = () => ws.send(JSON.stringify({ event: registerEvent, uuid }));
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.event === 'didReceiveSettings') {
+          settings = (msg.payload && msg.payload.settings) || {};
+          render();
+        }
+      };
+    };
+  </script>
+</body>
+</html>

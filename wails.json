@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "SpeechToText",
+  "outputfilename": "SpeechToText",
+  "frontend:dir": "frontend",
+  "frontend:install": "",
+  "frontend:build": "",
+  "wailsjsdir": "",
+  "author": {
+    "name": "SpeechToText"
+  },
+  "info": {
+    "companyName": "SpeechToText",
+    "productName": "SpeechToText",
+    "productVersion": "1.2.1",
+    "copyright": "© 2026 SpeechToText",
+    "comments": "Voice typing for Windows with OpenAI gpt-live-transcribe"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "speechtotext-streamdeck",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@elgato/streamdeck": "2.1.2"
+  },
+  "devDependencies": {
+    "@elgato/cli": "^1.10.3",
+    "esbuild": "0.28.2"
+  }
+}

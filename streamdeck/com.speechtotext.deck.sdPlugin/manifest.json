@@ -1,0 +1,92 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "Name": "SpeechToText",
+  "Version": "1.2.1.0",
+  "Author": "SpeechToText",
+  "Description": "Голосовой ввод через OpenAI: диктовка в любое поле, звук системы в текст и перевод голосом. Во время записи кнопка горит красным и показывает время. Нужно запущенное приложение SpeechToText.",
+  "UUID": "com.speechtotext.deck",
+  "Icon": "imgs/plugin/marketplace",
+  "Category": "SpeechToText",
+  "CategoryIcon": "imgs/plugin/category-icon",
+  "CodePath": "bin/plugin.js",
+  "SDKVersion": 2,
+  "Software": {
+    "MinimumVersion": "6.6"
+  },
+  "OS": [
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    }
+  ],
+  "Nodejs": {
+    "Version": "20",
+    "Debug": "disabled"
+  },
+  "Actions": [
+    {
+      "Name": "Диктовка",
+      "UUID": "com.speechtotext.deck.dictate",
+      "Icon": "imgs/actions/dictate/icon",
+      "Tooltip": "Надиктовать текст в поле, где стоит курсор. Нажать — запись, ещё раз — вставка (или удерживать, пока говорите).",
+      "PropertyInspectorPath": "ui/settings.html",
+      "Controllers": [
+        "Keypad"
+      ],
+      "UserTitleEnabled": false,
+      "States": [
+        {
+          "Image": "imgs/actions/dictate/key"
+        }
+      ]
+    },
+    {
+      "Name": "Звук системы → текст",
+      "UUID": "com.speechtotext.deck.listen",
+      "Icon": "imgs/actions/listen/icon",
+      "Tooltip": "Записать то, что играет в колонках или наушниках (созвон, видео), и скопировать текст в буфер обмена.",
+      "PropertyInspectorPath": "ui/settings.html",
+      "Controllers": [
+        "Keypad"
+      ],
+      "UserTitleEnabled": false,
+      "States": [
+        {
+          "Image": "imgs/actions/listen/key"
+        }
+      ]
+    },
+    {
+      "Name": "Перевод",
+      "UUID": "com.speechtotext.deck.translate",
+      "Icon": "imgs/actions/translate/icon",
+      "Tooltip": "Сказать на одном языке — получить текст на другом. Языки выбираются в настройках кнопки.",
+      "PropertyInspectorPath": "ui/settings.html",
+      "Controllers": [
+        "Keypad"
+      ],
+      "UserTitleEnabled": false,
+      "States": [
+        {
+          "Image": "imgs/actions/translate/key"
+        }
+      ]
+    },
+    {
+      "Name": "Отмена",
+      "UUID": "com.speechtotext.deck.cancel",
+      "Icon": "imgs/actions/cancel/icon",
+      "Tooltip": "Остановить запись или обработку без вставки текста (как Esc).",
+      "PropertyInspectorPath": "ui/settings.html",
+      "Controllers": [
+        "Keypad"
+      ],
+      "UserTitleEnabled": false,
+      "States": [
+        {
+          "Image": "imgs/actions/cancel/key"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+# Build output
+build/bin/
+frontend/wailsjs/
+
+# Stream Deck plugin: dependencies and build output (cd streamdeck; npm run build)
+streamdeck/node_modules/
+streamdeck/com.speechtotext.deck.sdPlugin/bin/plugin.js
+deck/*.streamDeckPlugin
+logs/
+
+# Promo video project and renders — not part of the app
+promo/
+.hyperframes/
+
+# Local data and secrets. The app keeps its own (key, history, settings) in
+# %APPDATA%\SpeechToText, never here; these guard against stray copies.
+.env
+*.env
+control.json
+history.dat
+config.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.exe
+*.log
+Thumbs.db
+desktop.ini
