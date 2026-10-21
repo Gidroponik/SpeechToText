@@ -434,3 +434,78 @@ func TestWhisperServerReuse(t *testing.T) {
 		t.Fatal("Stop should unload")
 	}
 }
+
+func TestDownloadPlan(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	plan, err := downloadPlan("small-q5_1", "base-q5_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, p := range plan {
+		ids = append(ids, p.ID)
+	}
+	if want := []string{"cpu", "small-q5_1", "base-q5_1", "vad"}; !slices.Equal(ids, want) {
+		t.Fatalf("plan %v, want %v", ids, want)
+	}
+	if _, err := downloadPlan("medium"); err == nil {
+		t.Fatal("unknown model accepted")
+	}
+}
+
+// installFake puts files of the right names and sizes where installed()
+// looks, standing in for a finished download.
+func installFake(t *testing.T, pkgs ...whisperPackage) {
+	t.Helper()
+	for _, p := range pkgs {
+		if p.isRuntime() {
+			os.MkdirAll(p.path(), 0o755)
+			os.WriteFile(filepath.Join(p.path(), "release.txt"), []byte(whisperRelease), 0o644)
+			continue
+		}
+		os.MkdirAll(filepath.Dir(p.path()), 0o755)
+		f, err := os.Create(p.path())
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Truncate(p.Size)
+		f.Close()
+	}
+}
+
+func TestFirstRunSetupWithoutKey(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	gpu := nvidiaGPU() != ""
+	model, _ := findWhisperModel("small-q5_1")
+	if gpu {
+		model, _ = findWhisperModel("large-v3-turbo-q5_0")
+	}
+	cfg := defaultConfig()
+	if !needsSetup(cfg) {
+		t.Fatal("no key and nothing installed: setup is needed")
+	}
+	if withKey := cfg; func() bool { withKey.APIKey = "sealed"; return needsSetup(withKey) }() {
+		t.Fatal("a user with a key gets OpenAI, not a 1 GB download")
+	}
+
+	app := &App{store: &ConfigStore{path: filepath.Join(t.TempDir(), "config.json"), cfg: cfg}}
+	app.dict = newDictation(app)
+	app.whisper = newLocalEngine(app)
+	app.whisper.srv = fakeServer(t, &fakeWhisper{}) // the GPU warm-up talks to it
+	installFake(t, runtimeCPU, runtimeCUDA, vadModel, model.whisperPackage)
+	if err := app.whisper.AutoSetup(); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); app.whisper.progress() != nil; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("setup didn't finish")
+		}
+	}
+	l := app.store.Get().Local
+	if l.Model != model.ID || l.GPU != gpu || !l.Mic || !l.System || !l.SetupDone || l.missing() != "" {
+		t.Fatalf("after setup: %+v", l)
+	}
+	if needsSetup(app.store.Get()) {
+		t.Fatal("setup must not run again")
+	}
+}

@@ -18,6 +18,7 @@ const state = {
   live: {},          // last dictation state from the app
   hotkey: [],
   hasKey: true,
+  offline: false,    // dictation works without a key (Whisper on this computer)
   history: [],
 };
 
@@ -771,8 +772,9 @@ function confirmDeleteKey() {
   });
 }
 
+// The key pin warns only when nothing can recognise speech: offline works without a key.
 function updateKeyPin() {
-  $('#pin-api').classList.toggle('on', !state.hasKey);
+  $('#pin-api').classList.toggle('on', !state.hasKey && !state.offline);
 }
 
 // ---------------------------------------------------------------- offline panel
@@ -802,7 +804,10 @@ const dlBlock = (dl) => `
   <div class="group">
     <div class="row col dl">
       <div class="inline">
-        <div class="row-text"><b id="dlLabel">${esc(dl.label)}</b><small id="dlBytes">${fmtSize(dl.done)} из ${fmtSize(dl.total)}</small></div>
+        <div class="row-text">
+          <b>${dl.target === 'setup' ? 'Настраиваю распознавание без интернета' : 'Загрузка'}</b>
+          <small><span id="dlLabel">${esc(dl.label)}</span> · <span id="dlBytes">${fmtSize(dl.done)} из ${fmtSize(dl.total)}</span></small>
+        </div>
         <button class="btn sm" id="dlCancel">Отмена</button>
       </div>
       <div class="lvl"><i id="dlBar" style="width:${Math.floor((dl.done / Math.max(1, dl.total)) * 100)}%"></i></div>
@@ -813,6 +818,7 @@ async function renderLocal() {
   const v = await api().GetLocalView();
   const dl = v.download;
   const ready = !v.missing;
+  const waiting = dl?.target === 'setup' ? 'Включится сам, как только модель скачается' : 'Сначала скачайте и выберите модель ниже';
   const device = v.gpuName ? `
     <div>
       <div class="label"><span>Где считать</span></div>
@@ -833,8 +839,8 @@ async function renderLocal() {
       <div>
         <div class="label"><span>Распознавать здесь, а не в OpenAI</span></div>
         <div class="group">
-          ${sw('localMic', v.mic, 'Диктовка и переводы', ready ? 'Речь с микрофона не уходит в интернет' : 'Сначала скачайте и выберите модель ниже', !ready)}
-          ${sw('localSystem', v.system, 'Звук ПК', ready ? 'Видео, созвоны и голосовые — тоже на этом компьютере' : 'Сначала скачайте и выберите модель ниже', !ready)}
+          ${sw('localMic', v.mic, 'Диктовка и переводы', ready ? 'Речь с микрофона не уходит в интернет' : waiting, !ready)}
+          ${sw('localSystem', v.system, 'Звук ПК', ready ? 'Видео, созвоны и голосовые — тоже на этом компьютере' : waiting, !ready)}
         </div>
       </div>
       ${dl ? dlBlock(dl) : ''}
@@ -905,10 +911,13 @@ function onLocalProgress(dl) {
   $('#dlBytes').textContent = `${fmtSize(dl.done)} из ${fmtSize(dl.total)}`;
 }
 
-function onLocalChanged(msg) {
-  if (msg) notify(msg, !msg.startsWith('Загрузка отменена'));
-  else notify('Готово — Whisper работает на этом компьютере');
+function onLocalChanged(r) {
+  notify(r.msg, !r.ok);
   if (state.open === 'local') refresh(true);
+  api().GetState().then((s) => {
+    state.offline = s.offline;
+    updateKeyPin();
+  }).catch(() => {});
 }
 
 // ---------------------------------------------------------------- text panel
@@ -1186,9 +1195,14 @@ function appear() {
   firstAppear = false;
   api().GetState().then((s) => {
     state.hasKey = s.hasKey;
+    state.offline = s.offline;
     state.hotkey = s.hotkey;
     updateKeyPin();
-    if (!s.hasKey && !s.offline) {
+    if (s.setup) {
+      // First run without a key: the offline model is downloading by itself.
+      brandMessage('Настраиваю распознавание без интернета…', 5000);
+      setTimeout(() => openPanel('local', false), 500);
+    } else if (!s.hasKey && !s.offline) {
       brandMessage('Добавьте API-ключ OpenAI');
       setTimeout(() => openPanel('api', false), 500);
     } else if (s.hotkey?.length) {

@@ -24,7 +24,7 @@ const (
 )
 
 // version is stamped at build time (-X main.version=1.2.3).
-var version = "1.3.0"
+var version = "1.3.1"
 
 type App struct {
 	ctx       context.Context
@@ -70,6 +70,11 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.control = c
 	a.publishState(LiveState{Phase: "idle"})
+	if needsSetup(a.store.Get()) {
+		if err := a.whisper.AutoSetup(); err != nil {
+			log.Printf("offline setup: %v", err)
+		}
+	}
 }
 
 // syncHotkeys hands every assigned hotkey to the keyboard hook.
@@ -244,6 +249,7 @@ func (a *App) Quit() {
 type StateView struct {
 	HasKey  bool     `json:"hasKey"`
 	Offline bool     `json:"offline"` // dictation works without a key
+	Setup   bool     `json:"setup"`   // the first-run offline setup is downloading
 	Hotkey  []string `json:"hotkey"`
 	Mode    string   `json:"mode"`
 	Version string   `json:"version"`
@@ -253,6 +259,7 @@ func (a *App) GetState() StateView {
 	cfg := a.store.Get()
 	return StateView{
 		HasKey: cfg.APIKey != "", Offline: cfg.Local.Mic && cfg.Local.missing() == "",
+		Setup:  a.whisper.progress() != nil && a.whisper.progress().Target == "setup",
 		Hotkey: cfg.Hotkey.Parts(), Mode: cfg.Mode, Version: version,
 	}
 }

@@ -189,6 +189,12 @@ func (d *dictation) Start(expect dictPhase, spec actionSpec, test bool) {
 		if err != nil {
 			msg = err.Error()
 		}
+		if dl := d.app.whisper.progress(); dl != nil && dl.Total > 0 {
+			msg = fmt.Sprintf("Модель для распознавания ещё скачивается (%d%%) — подождите немного", dl.Done*100/dl.Total)
+			d.fail(msg)
+			d.app.openPanel("local")
+			return
+		}
 		d.fail(msg)
 		d.app.openPanel("api")
 		return

@@ -142,6 +142,16 @@ type LocalConfig struct {
 	Model  string `json:"model"`  // a whisperModels id
 	GPU    bool   `json:"gpu"`    // the CUDA build instead of the CPU one
 	Load   string `json:"load"`   // CPU threads: low | normal | max
+
+	// SetupDone: the first-run setup for a user without an API key has run
+	// (or was cancelled), so it isn't started again.
+	SetupDone bool `json:"setupDone"`
+}
+
+// needsSetup: there is no key to use OpenAI and offline recognition hasn't
+// been set up, so the app should get it going on its own.
+func needsSetup(cfg Config) bool {
+	return cfg.APIKey == "" && !cfg.Local.SetupDone && cfg.Local.missing() != ""
 }
 
 func (l LocalConfig) usedFor(source string) bool {
@@ -364,10 +374,54 @@ type localEngine struct {
 
 // DownloadView is the progress the offline panel shows.
 type DownloadView struct {
-	Target string `json:"target"` // a model id or "cuda"
+	Target string `json:"target"` // a model id, "cuda", or "setup" (the first-run setup)
 	Label  string `json:"label"`  // what is happening now
 	Done   int64  `json:"done"`
 	Total  int64  `json:"total"`
+}
+
+// LocalResult ends a download: the "local-changed" event.
+type LocalResult struct {
+	OK  bool   `json:"ok"`
+	Msg string `json:"msg"`
+}
+
+// download is one run of fetching: what to fetch and what to do after.
+type download struct {
+	target string
+	plan   []whisperPackage
+	adopt  func(*Config)   // settings to apply once everything is in
+	done   string          // the message on success
+	ended  func(err error) // called last, whatever the outcome
+}
+
+// downloadPlan lists what targets (model ids or "cuda") need that isn't on
+// disk yet. The CPU build goes with every model: it is small and the
+// fallback; the speech detector goes with everything.
+func downloadPlan(targets ...string) ([]whisperPackage, error) {
+	var plan []whisperPackage
+	need := func(p whisperPackage) {
+		if !p.installed() && !slices.ContainsFunc(plan, func(q whisperPackage) bool { return q.ID == p.ID }) {
+			plan = append(plan, p)
+		}
+	}
+	for _, t := range targets {
+		if t == "cuda" {
+			if nvidiaGPU() == "" {
+				return nil, errors.New("видеокарта NVIDIA не найдена")
+			}
+			need(runtimeCUDA)
+			continue
+		}
+		m, ok := findWhisperModel(t)
+		if !ok {
+			return nil, fmt.Errorf("неизвестная модель %q", t)
+		}
+		need(runtimeCPU)
+		need(m.whisperPackage)
+	}
+	need(vadModel)
+	return plan, nil
 }
 
 func newLocalEngine(app *App) *localEngine {
@@ -387,39 +441,66 @@ func (e *localEngine) progress() *DownloadView {
 // Download fetches what target needs — a model (with the CPU build, which
 // is small and always the fallback) or the CUDA build — in the background.
 func (e *localEngine) Download(target string) error {
-	var plan []whisperPackage
-	need := func(p whisperPackage) {
-		if !p.installed() {
-			plan = append(plan, p)
-		}
+	plan, err := downloadPlan(target)
+	if err != nil {
+		return err
 	}
-	if target == "cuda" {
-		if nvidiaGPU() == "" {
-			return errors.New("видеокарта NVIDIA не найдена")
+	return e.start(download{target: target, plan: plan, adopt: func(c *Config) {
+		if target == "cuda" {
+			c.Local.GPU = true
+		} else {
+			c.Local.Model = target
 		}
-		need(runtimeCUDA)
-	} else {
-		m, ok := findWhisperModel(target)
-		if !ok {
-			return fmt.Errorf("неизвестная модель %q", target)
-		}
-		need(runtimeCPU)
-		need(m.whisperPackage)
-	}
-	need(vadModel)
+	}})
+}
 
+// AutoSetup gets offline recognition going by itself for someone without an
+// API key: the model that suits this computer — Large v3 Turbo with the CUDA
+// build on an NVIDIA card, Small on the CPU — and once it is in, dictation
+// and system audio use it. Nothing to click.
+func (e *localEngine) AutoSetup() error {
+	gpu := nvidiaGPU() != ""
+	model, targets := "small-q5_1", []string{"small-q5_1"}
+	if gpu {
+		model, targets = "large-v3-turbo-q5_0", []string{"large-v3-turbo-q5_0", "cuda"}
+	}
+	plan, err := downloadPlan(targets...)
+	if err != nil {
+		return err
+	}
+	hotkey := strings.Join(e.app.store.Get().Hotkey.Parts(), "+")
+	return e.start(download{
+		target: "setup", plan: plan,
+		adopt: func(c *Config) {
+			c.Local.Model, c.Local.GPU = model, gpu
+			c.Local.Mic, c.Local.System, c.Local.SetupDone = true, true, true
+		},
+		done: "Готово: диктовка работает без интернета — нажмите " + hotkey,
+		ended: func(err error) {
+			switch {
+			case errors.Is(err, context.Canceled): // declined: don't start it again on every launch
+				_ = e.app.store.Update(func(c *Config) { c.Local.SetupDone = true })
+			case err == nil && e.app.overlay != nil:
+				e.app.overlay.Show(overlayFrame{Kind: ovInfo, Text: "Распознавание без интернета готово"}, 4*time.Second)
+			}
+			// On a network error it is tried again at the next launch.
+		},
+	})
+}
+
+func (e *localEngine) start(d download) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.dl != nil {
 		return errors.New("уже идёт загрузка — дождитесь её или отмените")
 	}
 	var total int64
-	for _, p := range plan {
+	for _, p := range d.plan {
 		total += p.Size
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	e.dl, e.cancel = &DownloadView{Target: target, Label: "Подготовка…", Total: total}, cancel
-	go e.run(ctx, target, plan)
+	e.dl, e.cancel = &DownloadView{Target: d.target, Label: "Подготовка…", Total: total}, cancel
+	go e.run(ctx, d)
 	return nil
 }
 
@@ -440,32 +521,37 @@ func (e *localEngine) setStage(label string) {
 	e.app.emit("local-progress", e.progress())
 }
 
-func (e *localEngine) run(ctx context.Context, target string, plan []whisperPackage) {
-	err := e.fetchAll(ctx, plan)
+func (e *localEngine) run(ctx context.Context, d download) {
+	err := e.fetchAll(ctx, d.plan)
 	if err == nil {
-		err = e.app.store.Update(func(c *Config) {
-			if target == "cuda" {
-				c.Local.GPU = true
-			} else {
-				c.Local.Model = target
-			}
-		})
+		err = e.app.store.Update(d.adopt)
 	}
+	res := LocalResult{OK: true, Msg: d.done}
 	if l := e.app.store.Get().Local; err == nil && l.GPU && l.missing() == "" {
 		e.setStage("Подготовка видеокарты — один раз, до минуты…")
-		err = e.warmUp(ctx, l)
+		if werr := e.warmUp(ctx, l); werr != nil && ctx.Err() == nil {
+			// An old driver, too little video memory…: the CPU still works.
+			_ = e.app.store.Update(func(c *Config) { c.Local.GPU = false })
+			res.Msg = "Видеокарта не запустилась, распознаёт процессор: " + werr.Error()
+		} else {
+			err = werr
+		}
 	}
 	e.mu.Lock()
 	e.dl, e.cancel = nil, nil
 	e.mu.Unlock()
-	msg := ""
 	switch {
 	case errors.Is(err, context.Canceled):
-		msg = "Загрузка отменена"
+		res.Msg = "Загрузка отменена"
 	case err != nil:
-		msg = "Не удалось: " + err.Error()
+		res = LocalResult{Msg: "Не удалось: " + err.Error()}
+	case res.Msg == "":
+		res.Msg = "Готово — Whisper работает на этом компьютере"
 	}
-	e.app.emit("local-changed", msg)
+	if d.ended != nil {
+		d.ended(err)
+	}
+	e.app.emit("local-changed", res)
 }
 
 func (e *localEngine) fetchAll(ctx context.Context, plan []whisperPackage) error {

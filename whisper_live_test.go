@@ -108,3 +108,33 @@ func TestLiveWhisper(t *testing.T) {
 		}
 	}
 }
+
+// A fresh computer without an API key: the setup downloads and switches
+// offline recognition on by itself (into a temporary folder here).
+func TestLiveFirstRun(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	app := &App{store: &ConfigStore{path: filepath.Join(t.TempDir(), "config.json"), cfg: defaultConfig()}}
+	app.dict = newDictation(app)
+	app.whisper = newLocalEngine(app)
+	defer app.whisper.Stop()
+	if !needsSetup(app.store.Get()) {
+		t.Fatal("setup should be needed")
+	}
+	began := time.Now()
+	if err := app.whisper.AutoSetup(); err != nil {
+		t.Fatal(err)
+	}
+	last := ""
+	for dl := app.whisper.progress(); dl != nil; dl = app.whisper.progress() {
+		if dl.Label != last {
+			last = dl.Label
+			t.Logf("%5.1fs  %s (%d of %d MB)", time.Since(began).Seconds(), dl.Label, dl.Done>>20, dl.Total>>20)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	l := app.store.Get().Local
+	t.Logf("%.1fs: %+v, missing %q", time.Since(began).Seconds(), l, l.missing())
+	if !l.Mic || !l.System || l.missing() != "" || l.GPU != (nvidiaGPU() != "") {
+		t.Fatal("offline recognition should be on and ready")
+	}
+}
