@@ -51,6 +51,7 @@ type actionSpec struct {
 	To     string // translate into, "" = no translation
 	Style  string // clean-up style, "" = the one from the text panel
 	Output string // insert | clipboard | show
+	Local  bool   // recognise with whisper whatever the settings say (the offline panel's test)
 }
 
 func validOutput(o string) bool { return o == "insert" || o == "clipboard" || o == "show" }

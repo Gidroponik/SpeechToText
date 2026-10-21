@@ -225,6 +225,10 @@ type insertOptions struct {
 
 // insertText delivers text to the focused input of target (the window that
 // was active when dictation started) and describes what happened.
+// errNoTarget means there is no other app to type into: the hotkey was
+// pressed while our own window was in front.
+var errNoTarget = errors.New("нет поля для вставки")
+
 func insertText(text string, o insertOptions, target windows.HWND) (string, error) {
 	if o.Mode == "clipboard" {
 		if err := setClipboardText(text, false); err != nil {
@@ -237,10 +241,7 @@ func insertText(text string, o insertOptions, target windows.HWND) (string, erro
 	if windowPID(fg) == uint32(os.Getpid()) {
 		// Our own panel is in front; the text belongs to the app used before.
 		if r, _, _ := procIsWindow.Call(uintptr(target)); r == 0 || windowPID(target) == uint32(os.Getpid()) {
-			if err := setClipboardText(text, false); err != nil {
-				return "", err
-			}
-			return "Скопировано в буфер", nil
+			return "", errNoTarget
 		}
 		procSetForegroundWindow.Call(uintptr(target))
 		time.Sleep(120 * time.Millisecond)

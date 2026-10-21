@@ -9,7 +9,7 @@ const card = $('#card');
 const panel = $('#panel');
 
 const state = {
-  open: null,        // 'record' | 'api' | 'text' | 'history' | 'settings' | null
+  open: null,        // 'record' | 'listen' | 'translate' | 'text' | 'api' | 'local' | 'history' | 'settings' | 'result' | null
   busy: false,       // a window animation is running
   lastHtml: '',      // last rendered panel markup, to skip useless re-renders
   phase: 'idle',     // dictation: idle | recording | processing
@@ -170,6 +170,7 @@ function renderView(name) {
     case 'translate': return renderTranslate();
     case 'result': return renderResult();
     case 'api': return renderAPI();
+    case 'local': return renderLocal();
     case 'text': return renderText();
     case 'history': return renderHistory();
     case 'settings': return renderSettings();
@@ -183,6 +184,7 @@ function bindView(name) {
     case 'translate': return bindTranslate();
     case 'result': return bindResult();
     case 'api': return bindAPI();
+    case 'local': return bindLocal();
     case 'text': return bindText();
     case 'history': return bindHistory();
     case 'settings': return bindSettings();
@@ -229,8 +231,8 @@ const sw = (key, on, title, text, disabled = false) => `
     <label class="switch"><input type="checkbox" data-flag="${key}" ${on ? 'checked' : ''} ${disabled ? 'disabled' : ''}><span></span></label>
   </div>`;
 
-const seg = (key, items, value) => `
-  <div class="seg" data-seg="${key}">
+const seg = (key, items, value, fn = 'SetOption') => `
+  <div class="seg" data-seg="${key}" data-fn="${fn}">
     ${items.map(([v, t]) => `<button class="${v === value ? 'on' : ''}" data-value="${v}">${t}</button>`).join('')}
   </div>`;
 
@@ -244,6 +246,7 @@ const langSelect = (fn, key, langs, value, empty) => `
 const OPTION_SAVED = {
   mode: { toggle: 'Режим: нажать и говорить', hold: 'Режим: удерживать' },
   style: { raw: 'Без обработки', clean: 'Стиль: чистка', polish: 'Стиль: редактура', formal: 'Стиль: деловой' },
+  gpu: { on: 'Распознаёт видеокарта', off: 'Распознаёт процессор' },
 };
 
 function bindCommon() {
@@ -256,6 +259,7 @@ function bindCommon() {
       } catch { return; }
       panel.querySelectorAll(`.opt[data-group="${group}"][data-fn="${el.dataset.fn}"]`).forEach((o) => o.classList.toggle('sel', o === el));
       notify(OPTION_SAVED[group]?.[el.dataset.value] ?? 'Сохранено');
+      if (state.open === 'local') refresh(); // recommendations follow the device
     });
   });
   panel.querySelectorAll('input[data-flag]').forEach((el) => {
@@ -271,7 +275,7 @@ function bindCommon() {
   panel.querySelectorAll('.seg[data-seg]').forEach((s) => {
     s.querySelectorAll('button').forEach((b) => b.addEventListener('click', async () => {
       try {
-        await call('SetOption', s.dataset.seg, b.dataset.value);
+        await call(s.dataset.fn, s.dataset.seg, b.dataset.value);
       } catch { return; }
       s.querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
       notify('Сохранено');
@@ -429,7 +433,8 @@ function onTestResult(r) {
     box.innerHTML = `
       <div><div class="lbl">Итог</div><div class="txt">${esc(r.text)}</div></div>
       ${r.raw !== r.text ? `<div><div class="lbl">Распознано</div><div class="txt raw">${esc(r.raw)}</div></div>` : ''}
-      ${r.note ? `<div class="hintline err">${esc(r.note)}</div>` : ''}`;
+      ${r.note ? `<div class="hintline err">${esc(r.note)}</div>` : ''}
+      ${r.engine ? `<div class="hintline">${esc(r.engine)} · текст готов через ${fmtSec(r.wait)} после остановки</div>` : ''}`;
   }
   box.hidden = false;
   fitWindow();
@@ -570,7 +575,7 @@ function onShowResult(r) {
 
 async function renderResult() {
   const r = state.result;
-  const ic = r.title.startsWith('Звук') ? 'speaker' : 'translate';
+  const ic = r.title.startsWith('Звук') ? 'speaker' : r.title.startsWith('Перевод') ? 'translate' : 'mic';
   return `
     <div class="view">
       ${vh(ic, esc(r.title), `${fmtLen(r.seconds)} записи · текст можно выделить или скопировать целиком`)}
@@ -770,6 +775,142 @@ function updateKeyPin() {
   $('#pin-api').classList.toggle('on', !state.hasKey);
 }
 
+// ---------------------------------------------------------------- offline panel
+
+const fmtSize = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1).replace('.', ',')} ГБ` : `${Math.max(1, Math.round(b / 1e6))} МБ`);
+const fmtSec = (s) => `${s < 10 ? s.toFixed(1).replace('.', ',') : Math.round(s)} с`;
+const LOADS = [['low', 'Щадящая'], ['normal', 'Обычная'], ['max', 'Максимум']];
+
+// pick is a radio row for something that may not be downloaded yet: then it
+// can't be chosen and offers a download instead.
+function pick(group, value, title, sub, sel, installed, size, target, dl) {
+  if (installed) {
+    return opt(group, value, title, sub, sel, size ? `<span class="size">${fmtSize(size)}</span>` : '', 'SetLocalOption');
+  }
+  const right = dl?.target === target
+    ? `<span class="size">${Math.floor((dl.done / Math.max(1, dl.total)) * 100)}%</span>`
+    : `<button class="btn sm ${dl ? '' : 'primary'}" data-dl="${esc(target)}" ${dl ? 'disabled' : ''}>Скачать ${fmtSize(size)}</button>`;
+  return `
+    <div class="opt off">
+      <span class="radio">${icon('check', '')}</span>
+      <span class="row-text"><b>${title}</b><small>${sub}</small></span>
+      ${right}
+    </div>`;
+}
+
+const dlBlock = (dl) => `
+  <div class="group">
+    <div class="row col dl">
+      <div class="inline">
+        <div class="row-text"><b id="dlLabel">${esc(dl.label)}</b><small id="dlBytes">${fmtSize(dl.done)} из ${fmtSize(dl.total)}</small></div>
+        <button class="btn sm" id="dlCancel">Отмена</button>
+      </div>
+      <div class="lvl"><i id="dlBar" style="width:${Math.floor((dl.done / Math.max(1, dl.total)) * 100)}%"></i></div>
+    </div>
+  </div>`;
+
+async function renderLocal() {
+  const v = await api().GetLocalView();
+  const dl = v.download;
+  const ready = !v.missing;
+  const device = v.gpuName ? `
+    <div>
+      <div class="label"><span>Где считать</span></div>
+      <div class="group">
+        ${pick('gpu', 'on', `Видеокарта · ${esc(v.gpuName)}`, 'Доли секунды на фразу, процессор почти не занят. На новых картах первый запуск — до минуты', v.gpu, v.cuda, v.cuda ? 0 : v.cudaSize, 'cuda', dl)}
+        ${pick('gpu', 'off', 'Процессор', 'Работает на любом компьютере, но заметно медленнее', !v.gpu, true)}
+      </div>
+    </div>` : '';
+  const models = v.models.map((m) => pick('model', m.id,
+    `${esc(m.label)}${m.recommended ? '<span class="tag">рекомендуется</span>' : ''}`, esc(m.note),
+    v.model === m.id, m.installed, m.size, m.id, dl)).join('');
+  const files = v.models.filter((m) => m.installed).map((m) => [m.id, `Модель ${m.label}`, m.size]);
+  if (v.cuda) files.push(['cuda', 'Сборка для видеокарты', v.cudaDisk]);
+
+  return `
+    <div class="view">
+      ${vh('chip', 'Офлайн-распознавание', 'Whisper на этом компьютере: без интернета и без оплаты за минуты')}
+      <div>
+        <div class="label"><span>Распознавать здесь, а не в OpenAI</span></div>
+        <div class="group">
+          ${sw('localMic', v.mic, 'Диктовка и переводы', ready ? 'Речь с микрофона не уходит в интернет' : 'Сначала скачайте и выберите модель ниже', !ready)}
+          ${sw('localSystem', v.system, 'Звук ПК', ready ? 'Видео, созвоны и голосовые — тоже на этом компьютере' : 'Сначала скачайте и выберите модель ниже', !ready)}
+        </div>
+      </div>
+      ${dl ? dlBlock(dl) : ''}
+      ${device}
+      <div>
+        <div class="label"><span>Модель</span></div>
+        <div class="group">${models}</div>
+      </div>
+      <div class="group">
+        <div class="row col">
+          <div class="row-text"><b>Нагрузка на процессор</b><small>Сколько потоков занимать при распознавании. Приоритет у Whisper пониженный — игры и программы его не ждут</small></div>
+          ${seg('load', LOADS.map(([id, t]) => [id, `${t} · ${v.threads[id]}`]), v.load, 'SetLocalOption')}
+        </div>
+      </div>
+      ${ready ? testBlock('local') : ''}
+      <div class="note">${icon('shield')}<span>Звук не покидает компьютер. Чистка текста и перевод по-прежнему идут через OpenAI${v.hasKey ? ' — это доли цента' : ': без ключа вставится распознанный текст как есть, а перевод недоступен'}. Модель загружается при записи и выгружается из памяти через 5 минут простоя.</span></div>
+      ${files.length ? `
+      <div>
+        <div class="label"><span>Файлы</span><span class="count">${fmtSize(v.disk)}</span></div>
+        <div class="group">
+          ${files.map(([id, name, size]) => `
+            <div class="row file-row">
+              <div class="row-text"><b>${esc(name)}</b><small>${fmtSize(size)}</small></div>
+              <button class="icon-btn" data-rm="${esc(id)}" title="Удалить">${icon('trash')}</button>
+            </div>`).join('')}
+          <div class="row file-row">
+            <div class="row-text"><b>${v.loaded ? 'Модель сейчас в памяти' : 'Модель не загружена'}</b><span class="path">${esc(v.dir)}</span></div>
+            ${v.loaded ? '<button class="btn sm" id="unload">Выгрузить</button>' : ''}
+          </div>
+        </div>
+      </div>` : ''}
+    </div>`;
+}
+
+function bindLocal() {
+  panel.querySelectorAll('[data-dl]').forEach((b) => b.addEventListener('click', async () => {
+    try {
+      await call('LocalDownload', b.dataset.dl);
+    } catch { return; }
+    refresh(true);
+  }));
+  $('#dlCancel', panel)?.addEventListener('click', () => api().LocalCancelDownload());
+  panel.querySelectorAll('[data-rm]').forEach((b) => b.addEventListener('click', async () => {
+    try {
+      await call('LocalRemove', b.dataset.rm);
+    } catch { return; }
+    notify('Удалено');
+    refresh(true);
+  }));
+  $('#unload', panel)?.addEventListener('click', async () => {
+    try {
+      await call('LocalUnload');
+    } catch { return; }
+    notify('Память освобождена');
+    refresh(true);
+  });
+}
+
+function onLocalProgress(dl) {
+  if (state.open !== 'local' || !dl) return;
+  const bar = $('#dlBar');
+  if (!bar) {
+    refresh(true);
+    return;
+  }
+  bar.style.width = `${Math.floor((dl.done / Math.max(1, dl.total)) * 100)}%`;
+  $('#dlLabel').textContent = dl.label;
+  $('#dlBytes').textContent = `${fmtSize(dl.done)} из ${fmtSize(dl.total)}`;
+}
+
+function onLocalChanged(msg) {
+  if (msg) notify(msg, !msg.startsWith('Загрузка отменена'));
+  else notify('Готово — Whisper работает на этом компьютере');
+  if (state.open === 'local') refresh(true);
+}
+
 // ---------------------------------------------------------------- text panel
 
 const STYLES = [
@@ -844,7 +985,7 @@ async function renderHistory() {
   const rows = v.items.map((it, i) => `
     <div class="hist" data-i="${i}">
       <div class="row-text">
-        <div class="hist-meta">${it.kind ? `<span class="hist-kind">${esc(it.kind)}</span>` : ''}${fmtTime(it.time)} · ${fmtLen(it.seconds)} · $${it.cost.toFixed(4)}</div>
+        <div class="hist-meta">${it.kind ? `<span class="hist-kind">${esc(it.kind)}</span>` : ''}${fmtTime(it.time)} · ${fmtLen(it.seconds)}${it.cost ? ` · $${it.cost.toFixed(4)}` : ''}${it.engine ? ` · ${esc(it.engine)}` : ''}${it.wait ? ` · ${fmtSec(it.wait)}` : ''}</div>
         <div class="hist-text">${esc(it.text)}</div>
         ${it.raw !== it.text ? `<div class="hist-raw">Распознано: ${esc(it.raw)}</div>` : ''}
         ${it.note ? `<div class="hist-note">${esc(it.note)}</div>` : ''}
@@ -916,7 +1057,7 @@ async function renderSettings() {
         <div class="group">
           <div class="about">
             <img src="img/logo-mark.png" alt="">
-            <div class="row-text"><b>SpeechTo<span style="color:var(--accent)">Text</span></b><small>Версия ${esc(v.version)} · голосовой ввод через OpenAI gpt-live-transcribe</small></div>
+            <div class="row-text"><b>SpeechTo<span style="color:var(--accent)">Text</span></b><small>Версия ${esc(v.version)} · голосовой ввод через OpenAI gpt-live-transcribe или Whisper на этом ПК</small></div>
           </div>
         </div>
       </div>
@@ -1047,7 +1188,7 @@ function appear() {
     state.hasKey = s.hasKey;
     state.hotkey = s.hotkey;
     updateKeyPin();
-    if (!s.hasKey) {
+    if (!s.hasKey && !s.offline) {
       brandMessage('Добавьте API-ключ OpenAI');
       setTimeout(() => openPanel('api', false), 500);
     } else if (s.hotkey?.length) {
@@ -1082,6 +1223,8 @@ function init() {
   on('test-result', onTestResult);
   on('show-result', onShowResult);
   on('history-changed', () => { if (state.open === 'history') refresh(true); });
+  on('local-progress', onLocalProgress);
+  on('local-changed', onLocalChanged);
 
   appear();
 }

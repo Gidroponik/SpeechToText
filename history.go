@@ -19,6 +19,8 @@ type HistoryItem struct {
 	Seconds float64   `json:"seconds"`
 	Cost    float64   `json:"cost"` // USD, transcription + clean-up
 	Note    string    `json:"note,omitempty"`
+	Engine  string    `json:"engine,omitempty"` // "OpenAI" or the whisper model and device
+	Wait    float64   `json:"wait,omitempty"`   // seconds from stop to recognised text
 }
 
 type Usage struct {

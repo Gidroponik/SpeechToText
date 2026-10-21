@@ -19,12 +19,12 @@ import (
 // Window geometry in CSS pixels, including the transparent margin around the
 // card (--pad in frontend/dist/style.css): a 64px bar plus 10px on each side.
 const (
-	winW = 718
+	winW = 750
 	barH = 84
 )
 
 // version is stamped at build time (-X main.version=1.2.3).
-var version = "1.2.1"
+var version = "1.3.0"
 
 type App struct {
 	ctx       context.Context
@@ -33,6 +33,7 @@ type App struct {
 	hook      *keyHook
 	overlay   *overlay
 	dict      *dictation
+	whisper   *localEngine
 	win       nativeWindow
 	control   *controlServer
 	autostart bool    // launched by Windows at logon
@@ -50,6 +51,7 @@ type App struct {
 func NewApp(store *ConfigStore, hook *keyHook, ov *overlay, autostart bool) *App {
 	a := &App{store: store, history: NewHistory(), hook: hook, overlay: ov, autostart: autostart}
 	a.dict = newDictation(a)
+	a.whisper = newLocalEngine(a)
 	a.syncHotkeys()
 	go func() {
 		for ev := range hook.events {
@@ -104,6 +106,7 @@ var debugHook func(*App)
 
 func (a *App) shutdown(ctx context.Context) {
 	a.dict.Cancel()
+	a.whisper.Stop()
 	if a.control != nil {
 		a.control.close()
 	}
@@ -240,6 +243,7 @@ func (a *App) Quit() {
 
 type StateView struct {
 	HasKey  bool     `json:"hasKey"`
+	Offline bool     `json:"offline"` // dictation works without a key
 	Hotkey  []string `json:"hotkey"`
 	Mode    string   `json:"mode"`
 	Version string   `json:"version"`
@@ -247,7 +251,10 @@ type StateView struct {
 
 func (a *App) GetState() StateView {
 	cfg := a.store.Get()
-	return StateView{HasKey: cfg.APIKey != "", Hotkey: cfg.Hotkey.Parts(), Mode: cfg.Mode, Version: version}
+	return StateView{
+		HasKey: cfg.APIKey != "", Offline: cfg.Local.Mic && cfg.Local.missing() == "",
+		Hotkey: cfg.Hotkey.Parts(), Mode: cfg.Mode, Version: version,
+	}
 }
 
 // ---------- dictation panel ----------
@@ -340,15 +347,16 @@ func (a *App) CancelHotkeyCapture() {
 	a.hook.CancelCapture()
 }
 
-// TestStart records from the panel ("mic" or "system"); the result comes back
-// as "test-result" instead of being typed into another app. False when
-// recording didn't start.
+// TestStart records from the panel ("mic", "system", or "local": the
+// microphone through whisper); the result comes back as "test-result"
+// instead of being typed into another app. False when recording didn't start.
 func (a *App) TestStart(source string) bool {
 	id := "dictate"
 	if source == "system" {
 		id = "listen"
 	}
 	spec, _ := resolveAction(a.store.Get(), id, actionSpec{})
+	spec.Local = source == "local"
 	a.dict.Start(phIdle, spec, true)
 	a.dict.mu.Lock()
 	defer a.dict.mu.Unlock()
@@ -676,6 +684,10 @@ func (a *App) SetFlag(key string, on bool) error {
 		return setAutorun(on)
 	case "alwaysOnTop":
 		runtime.WindowSetAlwaysOnTop(a.ctx, on)
+	case "localMic", "localSystem":
+		if msg := a.store.Get().Local.missing(); on && msg != "" {
+			return errors.New(msg)
+		}
 	}
 	return a.store.Update(func(c *Config) {
 		switch key {
@@ -693,6 +705,128 @@ func (a *App) SetFlag(key string, on bool) error {
 			c.Settings.Sounds = on
 		case "keepHistory":
 			c.Settings.KeepHistory = on
+		case "localMic":
+			c.Local.Mic = on
+		case "localSystem":
+			c.Local.System = on
+		}
+	})
+}
+
+// ---------- offline panel ----------
+
+type LocalModelView struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Note        string `json:"note"`
+	Size        int64  `json:"size"`
+	Installed   bool   `json:"installed"`
+	Recommended bool   `json:"recommended"` // for the device chosen
+}
+
+type LocalView struct {
+	Mic      bool             `json:"mic"`
+	System   bool             `json:"system"`
+	Model    string           `json:"model"`
+	GPU      bool             `json:"gpu"`
+	Load     string           `json:"load"`
+	Threads  map[string]int   `json:"threads"` // load → CPU threads
+	Models   []LocalModelView `json:"models"`
+	GPUName  string           `json:"gpuName"`  // "" without an NVIDIA card
+	CUDA     bool             `json:"cuda"`     // the CUDA build is installed
+	CUDASize int64            `json:"cudaSize"` // download
+	CUDADisk int64            `json:"cudaDisk"` // unpacked
+	Missing  string           `json:"missing"`  // what keeps it from running, "" = ready
+	Download *DownloadView    `json:"download"`
+	Loaded   bool             `json:"loaded"` // a model is in memory now
+	Dir      string           `json:"dir"`
+	Disk     int64            `json:"disk"` // bytes the files take
+	HasKey   bool             `json:"hasKey"`
+}
+
+func (a *App) GetLocalView() LocalView {
+	cfg := a.store.Get()
+	l := cfg.Local
+	if l.Load == "" {
+		l.Load = "normal"
+	}
+	v := LocalView{
+		Mic: l.Mic, System: l.System, Model: l.Model, GPU: l.GPU, Load: l.Load,
+		Threads: map[string]int{"low": whisperThreads("low"), "normal": whisperThreads("normal"), "max": whisperThreads("max")},
+		GPUName: nvidiaGPU(), CUDA: runtimeCUDA.installed(), CUDASize: runtimeCUDA.Size,
+		Missing: l.missing(), Download: a.whisper.progress(), Loaded: a.whisper.srv.loaded() != "",
+		Dir: whisperDir(), HasKey: cfg.APIKey != "",
+	}
+	for _, m := range whisperModels {
+		installed := m.installed()
+		rec := m.For == "gpu" && l.GPU || m.For == "cpu" && !l.GPU
+		v.Models = append(v.Models, LocalModelView{ID: m.ID, Label: m.Label, Note: m.Note, Size: m.Size, Installed: installed, Recommended: rec})
+		if installed {
+			v.Disk += m.Size
+		}
+	}
+	for _, p := range []whisperPackage{runtimeCPU, runtimeCUDA, vadModel} {
+		if p.installed() {
+			v.Disk += p.diskSize()
+		}
+	}
+	if v.CUDA {
+		v.CUDADisk = runtimeCUDA.diskSize()
+	}
+	return v
+}
+
+// LocalDownload fetches a model (target = its id) or the CUDA build ("cuda")
+// in the background; progress comes as "local-progress" events and the end
+// as "local-changed" (with an error message, or "").
+func (a *App) LocalDownload(target string) error {
+	return a.whisper.Download(target)
+}
+
+func (a *App) LocalCancelDownload() {
+	a.whisper.CancelDownload()
+}
+
+// LocalRemove deletes a model or the CUDA build.
+func (a *App) LocalRemove(target string) error {
+	return a.whisper.Remove(target)
+}
+
+// LocalUnload frees the memory the model takes until the next dictation.
+func (a *App) LocalUnload() error {
+	if a.dict.busyLocal() {
+		return errors.New("сейчас идёт распознавание")
+	}
+	a.whisper.srv.Stop()
+	return nil
+}
+
+// SetLocalOption stores an offline setting: model, gpu (on | off), load.
+func (a *App) SetLocalOption(key, value string) error {
+	switch key {
+	case "model":
+		if m, ok := findWhisperModel(value); !ok || !m.installed() {
+			return errors.New("сначала скачайте эту модель")
+		}
+	case "gpu":
+		if value == "on" && !runtimeCUDA.installed() {
+			return errors.New("сначала скачайте сборку для видеокарты")
+		}
+	case "load":
+		if !slices.Contains([]string{"low", "normal", "max"}, value) {
+			return fmt.Errorf("недопустимое значение %q", value)
+		}
+	default:
+		return fmt.Errorf("неизвестная настройка %q", key)
+	}
+	return a.store.Update(func(c *Config) {
+		switch key {
+		case "model":
+			c.Local.Model = value
+		case "gpu":
+			c.Local.GPU = value == "on"
+		case "load":
+			c.Local.Load = value
 		}
 	})
 }

@@ -62,6 +62,7 @@ type Config struct {
 
 	Listen       ListenConfig    `json:"listen"`
 	Translations []TranslateBind `json:"translations"`
+	Local        LocalConfig     `json:"local"` // whisper on this computer (whisper.go)
 
 	Settings Settings `json:"settings"`
 }
@@ -81,6 +82,7 @@ func defaultConfig() Config {
 		RestoreClipboard: true,
 		Version:          configVersion,
 		Listen:           ListenConfig{Style: "clean", Output: "show"},
+		Local:            LocalConfig{Load: "normal"},
 		Settings:         Settings{StartMinimized: true, Sounds: true, KeepHistory: true},
 	}
 }

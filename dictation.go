@@ -15,8 +15,8 @@ import (
 )
 
 // dictation runs one take at a time: record (microphone or system audio) and
-// stream to gpt-live-transcribe → clean up or translate the text → insert it
-// where the cursor is or copy it.
+// stream to gpt-live-transcribe or whisper on this computer → clean up or
+// translate the text → insert it where the cursor is or copy it.
 
 type dictPhase int
 
@@ -50,7 +50,8 @@ type dictation struct {
 	armTimer  *time.Timer
 	autoStop  *time.Timer
 	src       audioSource
-	live      *liveSession
+	live      transcriber
+	local     bool // whisper on this computer instead of OpenAI
 	capturing bool
 	pcm       []byte // kept for one retry if the live connection breaks
 	total     int    // audio bytes captured
@@ -167,9 +168,24 @@ func (d *dictation) Start(expect dictPhase, spec actionSpec, test bool) {
 	d.phase = phIdle
 
 	cfg := d.app.store.Get()
+	local := spec.Local || cfg.Local.usedFor(spec.Source)
 	api, err := d.app.apiConfig(cfg)
-	if err != nil || api.Key == "" {
-		msg := "Добавьте API-ключ OpenAI в разделе «API»"
+	switch {
+	case local && cfg.Local.missing() != "":
+		d.fail(cfg.Local.missing())
+		d.app.openPanel("local")
+		return
+	case local && (err != nil || api.Key == ""):
+		// Clean-up goes through OpenAI too, but without a key the recognised
+		// text will do. A translation won't.
+		api.Key = ""
+		if spec.To != "" {
+			d.fail("Перевод идёт через OpenAI — добавьте API-ключ в разделе «API»")
+			d.app.openPanel("api")
+			return
+		}
+	case !local && (err != nil || api.Key == ""):
+		msg := "Добавьте API-ключ OpenAI в разделе «API» или включите распознавание в разделе «Офлайн»"
 		if err != nil {
 			msg = err.Error()
 		}
@@ -178,13 +194,17 @@ func (d *dictation) Start(expect dictPhase, spec actionSpec, test bool) {
 		return
 	}
 
-	d.cfg, d.api, d.spec, d.test = cfg, api, spec, test
+	d.cfg, d.api, d.spec, d.test, d.local = cfg, api, spec, test, local
 	d.target = foregroundWindow()
 	d.pcm = make([]byte, 0, sampleRate*2*10) // the previous take's buffer may be huge: let it go
 	d.total, d.peak = 0, 0
-	d.seg = segmenter{}
+	d.seg = newSegmenter(local)
 	d.started = time.Now()
-	d.live = startLiveSession(api, transcribeOptions{Delay: cfg.Delay, Languages: spec.languages(cfg), Keywords: cfg.Keywords}, d.onPartial)
+	if local {
+		d.live = startLocalSession(d.app.whisper.srv, cfg.Local, spec.whisperLang(cfg), whisperPrompt(cfg.Keywords), d.onPartial)
+	} else {
+		d.live = startLiveSession(api, transcribeOptions{Delay: cfg.Delay, Languages: spec.languages(cfg), Keywords: cfg.Keywords}, d.onPartial)
+	}
 	d.capturing = true
 
 	var src audioSource
@@ -270,7 +290,7 @@ func (d *dictation) onData(pcm []byte) {
 		d.mu.Unlock()
 		return
 	}
-	if len(d.pcm)+len(pcm) <= maxRetryBuffer {
+	if !d.local && len(d.pcm)+len(pcm) <= maxRetryBuffer { // whisper needs no retry copy
 		d.pcm = append(d.pcm, pcm...)
 	}
 	d.total += len(pcm)
@@ -324,7 +344,7 @@ func (d *dictation) Stop() {
 	d.mu.Lock()
 	d.capturing, d.src = false, nil
 	job := take{
-		live: d.live, pcm: d.pcm, total: d.total, peak: d.peak, tail: d.seg.speech,
+		live: d.live, local: d.local, pcm: d.pcm, total: d.total, peak: d.peak, tail: d.seg.speech,
 		spec: d.spec, cfg: d.cfg, api: d.api, test: d.test, target: d.target,
 	}
 	if d.total > len(d.pcm) {
@@ -370,6 +390,13 @@ func (d *dictation) Cancel() {
 	d.app.overlay.Show(overlayFrame{Kind: ovInfo, Text: "Отменено"}, 900*time.Millisecond)
 }
 
+// busyLocal reports whether a take is using whisper right now.
+func (d *dictation) busyLocal() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.phase != phIdle && d.local
+}
+
 func (d *dictation) finish() {
 	d.mu.Lock()
 	d.phase, d.cancel, d.live = phIdle, nil, nil
@@ -379,7 +406,8 @@ func (d *dictation) finish() {
 }
 
 type take struct {
-	live   *liveSession
+	live   transcriber
+	local  bool
 	pcm    []byte // nil when the take was too long to keep for a retry
 	total  int
 	peak   float64
@@ -393,10 +421,12 @@ type take struct {
 
 // TestResult is what the panel's test recording shows.
 type TestResult struct {
-	Raw   string `json:"raw"`
-	Text  string `json:"text"`
-	Note  string `json:"note"`
-	Error string `json:"error"`
+	Raw    string  `json:"raw"`
+	Text   string  `json:"text"`
+	Note   string  `json:"note"`
+	Error  string  `json:"error"`
+	Engine string  `json:"engine"`
+	Wait   float64 `json:"wait"` // seconds from stop to recognised text
 }
 
 func (d *dictation) process(ctx context.Context, t take) {
@@ -444,11 +474,18 @@ func (d *dictation) process(ctx context.Context, t take) {
 
 	ov.Show(overlayFrame{Kind: ovWorking, Text: "Распознаю…"}, 0)
 	opts := transcribeOptions{Delay: t.cfg.Delay, Languages: t.spec.languages(t.cfg), Keywords: t.cfg.Keywords}
-	fctx, cancel := context.WithTimeout(ctx, 30*time.Second+length/10)
+	limit, engine := 30*time.Second+length/10, "OpenAI"
+	if t.local {
+		// A CPU takes a while over a long take, and a new video card
+		// compiles its kernels the first time.
+		limit, engine = 2*time.Minute+length, t.cfg.Local.label()
+	}
+	began := time.Now()
+	fctx, cancel := context.WithTimeout(ctx, limit)
 	raw, err := t.live.Finish(fctx, t.tail)
 	cancel()
 	var ae *apiError
-	if err != nil && ctx.Err() == nil && !errors.As(err, &ae) && t.pcm != nil {
+	if err != nil && ctx.Err() == nil && !t.local && !errors.As(err, &ae) && t.pcm != nil {
 		// The live connection broke (network hiccup, VPN switch…): the whole
 		// recording is still here, so send it once more in one piece.
 		ov.Update(func(f *overlayFrame) { f.Text = "Повторная попытка…" })
@@ -467,14 +504,19 @@ func (d *dictation) process(ctx context.Context, t take) {
 		info("Речь не распознана", 1600*time.Millisecond)
 		return
 	}
+	wait := time.Since(began).Seconds()
 
-	cost := length.Minutes() * transcribePerMin
+	cost := 0.0
+	if !t.local {
+		cost = length.Minutes() * transcribePerMin
+	}
 	text, note := raw, ""
 	style := t.spec.Style
 	if style == "" {
 		style = t.cfg.Style
 	}
-	if t.spec.To != "" || style != "raw" {
+	// Offline without a key the recognised text goes out as is.
+	if (t.spec.To != "" || style != "raw") && t.api.Key != "" {
 		label, verb := "Улучшаю текст…", cleanupText
 		if t.spec.To != "" {
 			label = "Перевожу на " + langNative(t.spec.To) + "…"
@@ -506,7 +548,7 @@ func (d *dictation) process(ctx context.Context, t take) {
 	outcome, shown := "Готово", false
 	switch {
 	case t.test:
-		d.app.emit("test-result", TestResult{Raw: raw, Text: text, Note: note})
+		d.app.emit("test-result", TestResult{Raw: raw, Text: text, Note: note, Engine: engine, Wait: wait})
 	case ctx.Err() != nil:
 		return
 	case t.spec.Output == "show":
@@ -520,6 +562,13 @@ func (d *dictation) process(ctx context.Context, t take) {
 		outcome = "Скопировано в буфер"
 	default:
 		outcome, err = insertText(text, insertOptions{Mode: t.cfg.Insert, RestoreClipboard: t.cfg.RestoreClipboard, PressEnter: t.cfg.PressEnter}, t.target)
+		if errors.Is(err, errNoTarget) {
+			// Started from our own window (say, reading its text aloud): there
+			// is no field to type into, so show the text rather than quietly
+			// putting it on the clipboard.
+			d.app.showResult(ResultView{Title: t.spec.Label(), Text: text, Raw: raw, Seconds: length.Seconds(), Note: note})
+			outcome, shown, err = "Текст готов", true, nil
+		}
 		if err != nil {
 			failed("Не удалось вставить текст: " + err.Error())
 			return
@@ -540,7 +589,7 @@ func (d *dictation) process(ctx context.Context, t take) {
 	if t.spec.ID != "dictate" {
 		kind = t.spec.Label()
 	}
-	d.app.history.Add(HistoryItem{Time: time.Now(), Kind: kind, Raw: raw, Text: text, Seconds: length.Seconds(), Cost: cost, Note: note}, t.cfg.Settings.KeepHistory)
+	d.app.history.Add(HistoryItem{Time: time.Now(), Kind: kind, Raw: raw, Text: text, Seconds: length.Seconds(), Cost: cost, Note: note, Engine: engine, Wait: wait}, t.cfg.Settings.KeepHistory)
 	d.app.emit("history-changed", nil)
 }
 
@@ -584,6 +633,8 @@ type segmenter struct {
 	bytes  int     // audio since the last commit
 	quiet  int     // trailing quiet audio
 	speech bool    // current segment contains speech
+
+	minBytes, quietBytes, maxBytes int // split limits; zero means OpenAI's
 }
 
 const (
@@ -591,6 +642,15 @@ const (
 	segQuietBytes = sampleRate * 2 * 7 / 10 // … and only at a 0.7 s pause
 	segMaxBytes   = sampleRate * 2 * 120    // hard cap for a pause-less monologue
 )
+
+// newSegmenter splits a take for OpenAI or, for whisper, into shorter pieces
+// that each fit its 30-second window and keep a slow CPU from falling behind.
+func newSegmenter(local bool) segmenter {
+	if local {
+		return segmenter{minBytes: sampleRate * 2 * 10, quietBytes: sampleRate * 2 * 6 / 10, maxBytes: sampleRate * 2 * 28}
+	}
+	return segmenter{}
+}
 
 // push accounts for a chunk and reports whether to commit after it.
 func (s *segmenter) push(rms float64, n int) bool {
@@ -616,7 +676,11 @@ func (s *segmenter) push(rms float64, n int) bool {
 	default:
 		s.quiet = 0
 	}
-	if s.speech && (s.bytes >= segMinBytes && s.quiet >= segQuietBytes || s.bytes >= segMaxBytes) {
+	minB, quietB, maxB := s.minBytes, s.quietBytes, s.maxBytes
+	if minB == 0 {
+		minB, quietB, maxB = segMinBytes, segQuietBytes, segMaxBytes
+	}
+	if s.speech && (s.bytes >= minB && s.quiet >= quietB || s.bytes >= maxB) {
 		s.bytes, s.quiet, s.speech = 0, 0, false
 		return true
 	}
